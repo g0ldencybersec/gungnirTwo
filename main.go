@@ -8,7 +8,6 @@ import (
 	"log"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	ct "github.com/google/certificate-transparency-go"
@@ -27,37 +26,34 @@ type LogList struct {
 }
 
 type Log struct {
-	Description string `json:"description"`
-	LogID       string `json:"log_id"`
-	Key         string `json:"key"`
-	URL         string `json:"url"`
-	MMD         int    `json:"mmd"`
-	State       struct {
+	URL   string `json:"url"`
+	State struct {
 		Usable struct {
 			Timestamp string `json:"timestamp"`
 		} `json:"usable"`
 	} `json:"state"`
-	TemporalInterval struct {
-		StartInclusive string `json:"start_inclusive"`
-		EndExclusive   string `json:"end_exclusive"`
-	} `json:"temporal_interval"`
-}
-
-type CertInfo struct {
-	CommonName string    `json:"common_name"`
-	SANs       []string  `json:"sans"`
-	Issuer     string    `json:"issuer"`
-	NotBefore  time.Time `json:"not_before"`
-	NotAfter   time.Time `json:"not_after"`
-	LogURL     string    `json:"log_url"`
-	SeenAt     time.Time `json:"seen_at"`
 }
 
 type CTMonitor struct {
-	rootDomain string
-	certs      map[string]CertInfo
-	mu         sync.RWMutex
-	logs       []string
+	rootDomains map[string]bool
+	logs        []string
+}
+
+// Checks if a domain is a subdomain of any root domain in the global map
+func (m *CTMonitor) IsSubdomain(domain string) bool {
+	if _, ok := m.rootDomains[domain]; ok {
+		return true
+	}
+
+	parts := strings.Split(domain, ".")
+	for i := range parts {
+		parentDomain := strings.Join(parts[i:], ".")
+		if _, ok := m.rootDomains[parentDomain]; ok {
+			return true
+		}
+	}
+
+	return false
 }
 
 func fetchLogList() ([]string, error) {
@@ -82,7 +78,6 @@ func fetchLogList() ([]string, error) {
 		for _, l := range operator.Logs {
 			// A log is active if it has a usable timestamp
 			if l.State.Usable.Timestamp != "" {
-				fmt.Println(l.URL)
 				url := l.URL
 				if !strings.HasSuffix(url, "/") {
 					url += "/"
@@ -102,103 +97,85 @@ func fetchLogList() ([]string, error) {
 	return activeLogs, nil
 }
 
-func NewCTMonitor(rootDomain string) (*CTMonitor, error) {
+func NewCTMonitor(rootDomains []string) (*CTMonitor, error) {
 	logs, err := fetchLogList()
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize log list: %v", err)
 	}
 
 	log.Printf("Initialized with %d CT logs", len(logs))
-	for _, logURL := range logs {
-		log.Printf("Using log: %s", logURL)
+
+	roots := make(map[string]bool)
+	for _, domain := range rootDomains {
+		roots[domain] = true
 	}
 
 	return &CTMonitor{
-		rootDomain: rootDomain,
-		certs:      make(map[string]CertInfo),
-		logs:       logs,
+		rootDomains: roots,
+		logs:        logs,
 	}, nil
 }
 
-func (m *CTMonitor) isRelevantDomain(domain string) bool {
-	return strings.HasSuffix(domain, "."+m.rootDomain) || domain == m.rootDomain
-}
-
-func (m *CTMonitor) processCertificate(entry *ct.RawLogEntry, logURL string) {
-	var cert *x509.Certificate
-	var err error
-
-	switch entry.Leaf.TimestampedEntry.EntryType {
-	case ct.X509LogEntryType:
-		cert, err = x509.ParseCertificate(entry.Leaf.TimestampedEntry.X509Entry.Data)
-	case ct.PrecertLogEntryType:
-		cert, err = x509.ParseCertificate(entry.Leaf.TimestampedEntry.PrecertEntry.TBSCertificate)
-	default:
-		log.Printf("Unknown entry type: %v", entry.Leaf.TimestampedEntry.EntryType)
-		return
-	}
-
-	if err != nil {
-		log.Printf("Failed to parse certificate: %v", err)
-		return
-	}
-
-	relevant := false
-	if m.isRelevantDomain(cert.Subject.CommonName) {
-		relevant = true
-	}
-	for _, san := range cert.DNSNames {
-		if m.isRelevantDomain(san) {
-			relevant = true
-			break
-		}
-	}
-
-	if !relevant {
-		return
-	}
-
-	certInfo := CertInfo{
-		CommonName: cert.Subject.CommonName,
-		SANs:       cert.DNSNames,
-		Issuer:     cert.Issuer.CommonName,
-		NotBefore:  cert.NotBefore,
-		NotAfter:   cert.NotAfter,
-		LogURL:     logURL,
-		SeenAt:     time.Now(),
-	}
-
-	m.mu.Lock()
-	m.certs[cert.Subject.CommonName] = certInfo
-	m.mu.Unlock()
-
-	log.Printf("Found new certificate for domain %s", cert.Subject.CommonName)
-}
-
 func (m *CTMonitor) monitorLog(ctx context.Context, logURL string) error {
-	opts := jsonclient.Options{}
-	client, err := client.New(logURL, &http.Client{}, opts)
+	client, err := client.New(logURL, &http.Client{
+		Timeout: 10 * time.Second,
+		Transport: &http.Transport{
+			TLSHandshakeTimeout:   30 * time.Second,
+			ResponseHeaderTimeout: 30 * time.Second,
+			MaxIdleConnsPerHost:   10,
+			DisableKeepAlives:     false,
+			MaxIdleConns:          100,
+			IdleConnTimeout:       90 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+		},
+	}, jsonclient.Options{UserAgent: "g0lden_gungnir/2.0"})
 	if err != nil {
 		return fmt.Errorf("failed to create client: %v", err)
+	}
+
+	// Get the STH to find current tree size
+	sth, err := client.GetSTH(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get STH: %v", err)
 	}
 
 	scanOpts := scanner.ScannerOptions{
 		FetcherOptions: scanner.FetcherOptions{
 			BatchSize:     1000,
-			ParallelFetch: 5,
+			ParallelFetch: 10,
 			EndIndex:      0,
+			StartIndex:    int64(sth.TreeSize - uint64(100)),
 			Continuous:    true,
 		},
-		NumWorkers: 5,
+		Matcher:    NewSubdomainMatcher(m),
+		NumWorkers: 10,
 	}
 
 	scanner := scanner.NewScanner(client, scanOpts)
 
-	certMatcherFunc := func(entry *ct.RawLogEntry) {
-		m.processCertificate(entry, logURL)
-	}
+	return scanner.Scan(ctx, m.logCertInfo, m.logPrecertInfo)
+}
 
-	return scanner.Scan(ctx, certMatcherFunc, certMatcherFunc)
+// Prints out a short bit of info about |cert|, found at |index| in the
+// specified log
+func (m *CTMonitor) logCertInfo(entry *ct.RawLogEntry) {
+	parsedEntry, err := entry.ToLogEntry()
+	if x509.IsFatal(err) || parsedEntry.X509Cert == nil {
+		log.Printf("Process cert at index %d: <unparsed: %v>", entry.Index, err)
+	} else {
+		log.Printf("Process cert at index %d: CN: '%s'", entry.Index, parsedEntry.X509Cert.Subject.CommonName)
+	}
+}
+
+// Prints out a short bit of info about |precert|, found at |index| in the
+// specified log
+func (m *CTMonitor) logPrecertInfo(entry *ct.RawLogEntry) {
+	parsedEntry, err := entry.ToLogEntry()
+	if x509.IsFatal(err) || parsedEntry.Precert == nil {
+		log.Printf("Process precert at index %d: <unparsed: %v>", entry.Index, err)
+	} else {
+		log.Printf("Process precert at index %d: CN: '%s' Issuer: %s", entry.Index, parsedEntry.Precert.TBSCertificate.Subject.CommonName, parsedEntry.Precert.TBSCertificate.Issuer.CommonName)
+	}
 }
 
 func (m *CTMonitor) Start(ctx context.Context) {
@@ -215,16 +192,13 @@ func (m *CTMonitor) Start(ctx context.Context) {
 }
 
 func (m *CTMonitor) handleGetCerts(w http.ResponseWriter, r *http.Request) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(m.certs)
+	json.NewEncoder(w).Encode("google.com") //TODO fix
 }
 
 func main() {
 	ctx := context.Background()
-	monitor, err := NewCTMonitor("cisco.com") // Replace with your root domain
+	monitor, err := NewCTMonitor([]string{"google.com", "zendesk.com", "cisco.com"}) // Replace with your root domain
 	if err != nil {
 		log.Fatalf("Failed to create monitor: %v", err)
 	}
