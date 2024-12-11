@@ -39,23 +39,6 @@ type CTMonitor struct {
 	logs        []string
 }
 
-// Checks if a domain is a subdomain of any root domain in the global map
-func (m *CTMonitor) IsSubdomain(domain string) bool {
-	if _, ok := m.rootDomains[domain]; ok {
-		return true
-	}
-
-	parts := strings.Split(domain, ".")
-	for i := range parts {
-		parentDomain := strings.Join(parts[i:], ".")
-		if _, ok := m.rootDomains[parentDomain]; ok {
-			return true
-		}
-	}
-
-	return false
-}
-
 func fetchLogList() ([]string, error) {
 	resp, err := http.Get("https://www.gstatic.com/ct/log_list/v3/log_list.json")
 	if err != nil {
@@ -198,7 +181,7 @@ func (m *CTMonitor) handleGetCerts(w http.ResponseWriter, r *http.Request) {
 
 func main() {
 	ctx := context.Background()
-	monitor, err := NewCTMonitor([]string{"google.com", "zendesk.com", "cisco.com"}) // Replace with your root domain
+	monitor, err := NewCTMonitor([]string{"google.com", "zendesk.com", "cisco.com"})
 	if err != nil {
 		log.Fatalf("Failed to create monitor: %v", err)
 	}

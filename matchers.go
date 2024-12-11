@@ -1,6 +1,8 @@
 package main
 
 import (
+	"strings"
+
 	ct "github.com/google/certificate-transparency-go"
 	"github.com/google/certificate-transparency-go/x509"
 )
@@ -51,4 +53,21 @@ func (m *SubdomainMatcher) PrecertificateMatches(precert *ct.Precertificate) boo
 	// If we got here, all domains were subdomains
 	// But make sure we had at least one domain to check
 	return len(precert.TBSCertificate.DNSNames) > 0 || precert.TBSCertificate.Subject.CommonName != ""
+}
+
+// Checks if a domain is a subdomain of any root domain in the global map
+func (m *CTMonitor) IsSubdomain(domain string) bool {
+	if _, ok := m.rootDomains[domain]; ok {
+		return true
+	}
+
+	parts := strings.Split(domain, ".")
+	for i := range parts {
+		parentDomain := strings.Join(parts[i:], ".")
+		if _, ok := m.rootDomains[parentDomain]; ok {
+			return true
+		}
+	}
+
+	return false
 }
